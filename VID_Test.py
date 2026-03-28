@@ -3,33 +3,61 @@ import torch
 import torch.nn.functional as F
 
 
-def _to_numpy(x):
+def _to_tensor(x, device=None, dtype=torch.long):
+    """
+    Convert tensor / list / tuple / numpy / scalar to torch tensor.
+    """
     if torch.is_tensor(x):
-        return x.cpu().numpy()
-    return np.asarray(x)
+        return x.to(device=device, dtype=dtype) if device is not None else x.to(dtype=dtype)
+    if isinstance(x, np.ndarray):
+        t = torch.from_numpy(x)
+        return t.to(device=device, dtype=dtype) if device is not None else t.to(dtype=dtype)
+    if isinstance(x, (list, tuple)):
+        t = torch.tensor(x, dtype=dtype)
+        return t.to(device=device) if device is not None else t
+    t = torch.tensor([x], dtype=dtype)
+    return t.to(device=device) if device is not None else t
+
+
+def _to_numpy(x):
+    """
+    Convert tensor / list / tuple / scalar to numpy array.
+    """
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray):
+        return x
+    if isinstance(x, (list, tuple)):
+        return np.asarray(x)
+    return np.asarray([x])
+
+
+def _flatten_meta(x):
+    """
+    Make pid/camid arrays 1D.
+    """
+    arr = _to_numpy(x)
+    return arr.reshape(-1)
 
 
 def _unpack_eval_batch(batch):
     """
     Robustly unpack validation/test loader batches.
 
-    Expected minimum:
+    Many old ReID loaders return more than 3 values.
+    We only need:
         imgs, pids, camids
-
-    But some loaders may return extra items such as:
-        imgs, pids, camids, clothes, views, paths, etc.
-
-    We only need the first 3.
     """
-    if isinstance(batch, (list, tuple)):
-        if len(batch) < 3:
-            raise ValueError(f"Evaluation batch has too few elements: got {len(batch)}")
-        imgs = batch[0]
-        pids = batch[1]
-        camids = batch[2]
-        return imgs, pids, camids
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Unsupported batch type in evaluation: {type(batch)}")
 
-    raise TypeError(f"Unsupported batch type in evaluation: {type(batch)}")
+    if len(batch) < 3:
+        raise ValueError(f"Evaluation batch has too few elements: got {len(batch)}")
+
+    imgs = batch[0]
+    pids = batch[1]
+    camids = batch[2]
+    return imgs, pids, camids
 
 
 def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
@@ -43,7 +71,7 @@ def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
 
     all_cmc = []
     all_AP = []
-    num_valid_q = 0.
+    num_valid_q = 0.0
 
     for q_idx in range(num_q):
         q_pid = q_pids[q_idx]
@@ -60,11 +88,11 @@ def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
         cmc = orig_cmc.cumsum()
         cmc[cmc > 1] = 1
         all_cmc.append(cmc[:max_rank])
-        num_valid_q += 1.
+        num_valid_q += 1.0
 
         num_rel = orig_cmc.sum()
         tmp_cmc = orig_cmc.cumsum()
-        tmp_cmc = np.asarray([x / (i + 1.) for i, x in enumerate(tmp_cmc)]) * orig_cmc
+        tmp_cmc = np.asarray([x / (i + 1.0) for i, x in enumerate(tmp_cmc)]) * orig_cmc
         AP = tmp_cmc.sum() / num_rel
         all_AP.append(AP)
 
@@ -80,14 +108,14 @@ def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
 @torch.no_grad()
 def _extract_sequence_feature(model, imgs, pids, camids, device):
     imgs = imgs.to(device)
-    pids = pids.to(device)
-    camids = camids.to(device)
+    pids_t = _to_tensor(pids, device=device, dtype=torch.long).view(-1)
+    camids_t = _to_tensor(camids, device=device, dtype=torch.long).view(-1)
 
-    outputs = model(imgs, pids, cam_label=camids)
+    outputs = model(imgs, pids_t, cam_label=camids_t)
 
-    # Handle different model return formats
+    # old repos may return tuple/list
     if isinstance(outputs, (list, tuple)):
-        # Usually model returns (score, feat, ...)
+        # usually (score, feat, ...)
         if len(outputs) >= 2:
             feat = outputs[1]
         else:
@@ -95,10 +123,11 @@ def _extract_sequence_feature(model, imgs, pids, camids, device):
     else:
         feat = outputs
 
+    # some repos may wrap feat again
     if isinstance(feat, (list, tuple)):
         feat = feat[0]
 
-    # If shape is [B, T, C], average over temporal dim
+    # if temporal dimension still exists, average it
     if feat.dim() == 3:
         feat = feat.mean(dim=1)
 
@@ -116,8 +145,8 @@ def test(model, q_loader, g_loader):
         imgs, pids, camids = _unpack_eval_batch(batch)
         feat = _extract_sequence_feature(model, imgs, pids, camids, device)
         qf.append(feat)
-        q_pids.extend(_to_numpy(pids))
-        q_camids.extend(_to_numpy(camids))
+        q_pids.extend(_flatten_meta(pids).tolist())
+        q_camids.extend(_flatten_meta(camids).tolist())
 
     qf = torch.cat(qf, dim=0)
     q_pids = np.asarray(q_pids)
@@ -130,8 +159,8 @@ def test(model, q_loader, g_loader):
         imgs, pids, camids = _unpack_eval_batch(batch)
         feat = _extract_sequence_feature(model, imgs, pids, camids, device)
         gf.append(feat)
-        g_pids.extend(_to_numpy(pids))
-        g_camids.extend(_to_numpy(camids))
+        g_pids.extend(_flatten_meta(pids).tolist())
+        g_camids.extend(_flatten_meta(camids).tolist())
 
     gf = torch.cat(gf, dim=0)
     g_pids = np.asarray(g_pids)
@@ -147,9 +176,13 @@ def test(model, q_loader, g_loader):
     print('Results ----------')
     print(f'mAP: {mAP * 100:.1f}%')
     print('CMC curve')
-    print(f'Rank-1  : {cmc[0] * 100:.1f}%')
-    print(f'Rank-5  : {cmc[4] * 100:.1f}%')
-    print(f'Rank-10 : {cmc[9] * 100:.1f}%')
-    print(f'Rank-20 : {cmc[19] * 100:.1f}%')
+    if len(cmc) > 0:
+        print(f'Rank-1  : {cmc[0] * 100:.1f}%')
+    if len(cmc) > 4:
+        print(f'Rank-5  : {cmc[4] * 100:.1f}%')
+    if len(cmc) > 9:
+        print(f'Rank-10 : {cmc[9] * 100:.1f}%')
+    if len(cmc) > 19:
+        print(f'Rank-20 : {cmc[19] * 100:.1f}%')
 
     return cmc[0], mAP
