@@ -9,6 +9,29 @@ def _to_numpy(x):
     return np.asarray(x)
 
 
+def _unpack_eval_batch(batch):
+    """
+    Robustly unpack validation/test loader batches.
+
+    Expected minimum:
+        imgs, pids, camids
+
+    But some loaders may return extra items such as:
+        imgs, pids, camids, clothes, views, paths, etc.
+
+    We only need the first 3.
+    """
+    if isinstance(batch, (list, tuple)):
+        if len(batch) < 3:
+            raise ValueError(f"Evaluation batch has too few elements: got {len(batch)}")
+        imgs = batch[0]
+        pids = batch[1]
+        camids = batch[2]
+        return imgs, pids, camids
+
+    raise TypeError(f"Unsupported batch type in evaluation: {type(batch)}")
+
+
 def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
     num_q, num_g = distmat.shape
 
@@ -41,8 +64,7 @@ def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
 
         num_rel = orig_cmc.sum()
         tmp_cmc = orig_cmc.cumsum()
-        tmp_cmc = [x / (i + 1.) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
+        tmp_cmc = np.asarray([x / (i + 1.) for i, x in enumerate(tmp_cmc)]) * orig_cmc
         AP = tmp_cmc.sum() / num_rel
         all_AP.append(AP)
 
@@ -63,16 +85,20 @@ def _extract_sequence_feature(model, imgs, pids, camids, device):
 
     outputs = model(imgs, pids, cam_label=camids)
 
-    # Handle different possible return formats safely
+    # Handle different model return formats
     if isinstance(outputs, (list, tuple)):
-        feat = outputs[1] if len(outputs) > 1 else outputs[0]
+        # Usually model returns (score, feat, ...)
+        if len(outputs) >= 2:
+            feat = outputs[1]
+        else:
+            feat = outputs[0]
     else:
         feat = outputs
 
     if isinstance(feat, (list, tuple)):
         feat = feat[0]
 
-    # If feature still has temporal dimension, average it
+    # If shape is [B, T, C], average over temporal dim
     if feat.dim() == 3:
         feat = feat.mean(dim=1)
 
@@ -86,7 +112,8 @@ def test(model, q_loader, g_loader):
     model.eval()
 
     qf, q_pids, q_camids = [], [], []
-    for imgs, pids, camids in q_loader:
+    for batch in q_loader:
+        imgs, pids, camids = _unpack_eval_batch(batch)
         feat = _extract_sequence_feature(model, imgs, pids, camids, device)
         qf.append(feat)
         q_pids.extend(_to_numpy(pids))
@@ -99,7 +126,8 @@ def test(model, q_loader, g_loader):
     print(f'Extracted features for query set, obtained {qf.shape[0]}-by-{qf.shape[1]} matrix')
 
     gf, g_pids, g_camids = [], [], []
-    for imgs, pids, camids in g_loader:
+    for batch in g_loader:
+        imgs, pids, camids = _unpack_eval_batch(batch)
         feat = _extract_sequence_feature(model, imgs, pids, camids, device)
         gf.append(feat)
         g_pids.extend(_to_numpy(pids))
