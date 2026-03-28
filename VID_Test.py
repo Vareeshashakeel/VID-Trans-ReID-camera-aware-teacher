@@ -3,10 +3,10 @@ import torch
 import torch.nn.functional as F
 
 
+CLIP_LEN = 4  # must match training seq_len
+
+
 def _to_tensor(x, device=None, dtype=torch.long):
-    """
-    Convert tensor / list / tuple / numpy / scalar to torch tensor.
-    """
     if torch.is_tensor(x):
         return x.to(device=device, dtype=dtype) if device is not None else x.to(dtype=dtype)
     if isinstance(x, np.ndarray):
@@ -20,9 +20,6 @@ def _to_tensor(x, device=None, dtype=torch.long):
 
 
 def _to_numpy(x):
-    """
-    Convert tensor / list / tuple / scalar to numpy array.
-    """
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
     if isinstance(x, np.ndarray):
@@ -33,31 +30,88 @@ def _to_numpy(x):
 
 
 def _flatten_meta(x):
-    """
-    Make pid/camid arrays 1D.
-    """
     arr = _to_numpy(x)
     return arr.reshape(-1)
 
 
 def _unpack_eval_batch(batch):
-    """
-    Robustly unpack validation/test loader batches.
-
-    Many old ReID loaders return more than 3 values.
-    We only need:
-        imgs, pids, camids
-    """
     if not isinstance(batch, (list, tuple)):
         raise TypeError(f"Unsupported batch type in evaluation: {type(batch)}")
-
     if len(batch) < 3:
         raise ValueError(f"Evaluation batch has too few elements: got {len(batch)}")
-
     imgs = batch[0]
     pids = batch[1]
     camids = batch[2]
     return imgs, pids, camids
+
+
+def _pad_clip(frames, clip_len):
+    """
+    frames: [t, c, h, w]
+    pad last frame until clip_len
+    """
+    t = frames.shape[0]
+    if t >= clip_len:
+        return frames[:clip_len]
+    pad_count = clip_len - t
+    last = frames[-1:].repeat(pad_count, 1, 1, 1)
+    return torch.cat([frames, last], dim=0)
+
+
+@torch.no_grad()
+def _extract_sequence_feature(model, imgs, pids, camids, device, clip_len=CLIP_LEN):
+    """
+    imgs arrives from val loader as [1, T, C, H, W] because batch_size=1.
+    We split the long tracklet into multiple fixed-length clips of size clip_len,
+    run the model on each clip, then average the resulting embeddings.
+    """
+    imgs = imgs.to(device)
+
+    # metadata may come as list / tuple / scalar / tensor
+    pids_t = _to_tensor(pids, device=device, dtype=torch.long).view(-1)
+    camids_t = _to_tensor(camids, device=device, dtype=torch.long).view(-1)
+
+    # expected validation loader batch_size=1
+    if imgs.dim() != 5:
+        raise ValueError(f"Expected imgs to have 5 dims [B,T,C,H,W], got shape {tuple(imgs.shape)}")
+
+    B, T, C, H, W = imgs.shape
+    if B != 1:
+        raise ValueError(f"This evaluation code expects batch_size=1 for val/test, got B={B}")
+
+    frames = imgs[0]  # [T, C, H, W]
+
+    clip_feats = []
+    start = 0
+    while start < T:
+        clip = frames[start:start + clip_len]  # [t, C, H, W]
+        clip = _pad_clip(clip, clip_len)       # [clip_len, C, H, W]
+        clip = clip.unsqueeze(0)               # [1, clip_len, C, H, W]
+
+        outputs = model(clip, pids_t[:1], cam_label=camids_t[:1])
+
+        if isinstance(outputs, (list, tuple)):
+            if len(outputs) >= 2:
+                feat = outputs[1]
+            else:
+                feat = outputs[0]
+        else:
+            feat = outputs
+
+        if isinstance(feat, (list, tuple)):
+            feat = feat[0]
+
+        if feat.dim() == 3:
+            feat = feat.mean(dim=1)
+
+        feat = F.normalize(feat, p=2, dim=1)
+        clip_feats.append(feat)
+
+        start += clip_len
+
+    feat = torch.cat(clip_feats, dim=0).mean(dim=0, keepdim=True)
+    feat = F.normalize(feat, p=2, dim=1)
+    return feat.cpu()
 
 
 def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
@@ -106,36 +160,6 @@ def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
 
 
 @torch.no_grad()
-def _extract_sequence_feature(model, imgs, pids, camids, device):
-    imgs = imgs.to(device)
-    pids_t = _to_tensor(pids, device=device, dtype=torch.long).view(-1)
-    camids_t = _to_tensor(camids, device=device, dtype=torch.long).view(-1)
-
-    outputs = model(imgs, pids_t, cam_label=camids_t)
-
-    # old repos may return tuple/list
-    if isinstance(outputs, (list, tuple)):
-        # usually (score, feat, ...)
-        if len(outputs) >= 2:
-            feat = outputs[1]
-        else:
-            feat = outputs[0]
-    else:
-        feat = outputs
-
-    # some repos may wrap feat again
-    if isinstance(feat, (list, tuple)):
-        feat = feat[0]
-
-    # if temporal dimension still exists, average it
-    if feat.dim() == 3:
-        feat = feat.mean(dim=1)
-
-    feat = F.normalize(feat, p=2, dim=1)
-    return feat.cpu()
-
-
-@torch.no_grad()
 def test(model, q_loader, g_loader):
     device = next(model.parameters()).device
     model.eval()
@@ -143,7 +167,7 @@ def test(model, q_loader, g_loader):
     qf, q_pids, q_camids = [], [], []
     for batch in q_loader:
         imgs, pids, camids = _unpack_eval_batch(batch)
-        feat = _extract_sequence_feature(model, imgs, pids, camids, device)
+        feat = _extract_sequence_feature(model, imgs, pids, camids, device, clip_len=CLIP_LEN)
         qf.append(feat)
         q_pids.extend(_flatten_meta(pids).tolist())
         q_camids.extend(_flatten_meta(camids).tolist())
@@ -157,7 +181,7 @@ def test(model, q_loader, g_loader):
     gf, g_pids, g_camids = [], [], []
     for batch in g_loader:
         imgs, pids, camids = _unpack_eval_batch(batch)
-        feat = _extract_sequence_feature(model, imgs, pids, camids, device)
+        feat = _extract_sequence_feature(model, imgs, pids, camids, device, clip_len=CLIP_LEN)
         gf.append(feat)
         g_pids.extend(_flatten_meta(pids).tolist())
         g_camids.extend(_flatten_meta(camids).tolist())
